@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <time.h>
 #include "lmdb.h"
+#define random rand
+#define srandom srand
 
 int main(int argc,char * argv[])
 {
