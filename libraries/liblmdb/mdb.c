@@ -1231,10 +1231,16 @@ mdb_strerror(int err)
 #ifdef _WIN32
 	if(err >= MDB_WIN_ERROR){
 		return mdb_winstrerror(err - MDB_WIN_ERROR);
-	}	    
+	}
+	return mdb_winstrerror(err);
 #endif
 
 	return strerror(err);
+}
+
+size_t mdb_env_max_used(MDB_env *env)
+{
+	return (env->me_maxusedpg == 0 ? 3 : env->me_maxusedpg + 1) * env->me_psize;
 }
 
 /** assert(3) variant in cursor context */
@@ -1411,7 +1417,7 @@ static void mdb_audit(MDB_txn *txn)
 #endif
 
 #ifdef _WIN32
-static int 
+static int
 mdb_winerrno()
 {
 	return GetLastError() + MDB_WIN_ERROR;
@@ -1432,12 +1438,13 @@ static int
 mdb_ftruncate(HANDLE fd, size_t size)
 {
 	size = (size + 65535) & ~(size_t)65535;
-	LONG low = (LONG)size;
-	LONG hi = size >> 32;	
-	if (SetFilePointer(fd, low, &hi, 0) != (DWORD)size
-		|| !SetEndOfFile(fd)
-		|| SetFilePointer(fd, 0, NULL, 0) != 0)
-		return ErrCode();
+	LARGE_INTEGER position;
+	position.QuadPart = (LONGLONG)size;
+	if (!SetFilePointerEx(fd, position, NULL, FILE_BEGIN) ||
+		!SetEndOfFile(fd) ||
+		SetFilePointer(fd, 0, NULL, FILE_BEGIN) == INVALID_SET_FILE_POINTER)
+		return mdb_winerrno();
+	return 0;
 }
 
 int
@@ -1447,26 +1454,28 @@ mdb_map_next(MDB_env *env, size_t offset, size_t size)
 	unsigned int flags = env->me_flags;
 	int rc;
 	HANDLE mh;
-	LONG offlo,offhi;
+	DWORD offlo,offhi;
 	size_t file_size;
-	
+
 	file_size = offset + size;
 
 	rc = mdb_ftruncate(env->me_fd, file_size);
-	if(rc) return rc;	
+	if(rc)
+		return rc;
 	mh = CreateFileMapping(env->me_fd, NULL, flags & MDB_WRITEMAP ?
 		PAGE_READWRITE : PAGE_READONLY,
 		0, 0, NULL);
-	if (!mh) return ErrCode();
-	
+	if (!mh)
+		return ErrCode();
+
 	offlo = offset & 0xffffffff;
-	offhi = (LONG)(offset >> 16 >> 16);
+	offhi = (DWORD)(offset >> 16 >> 16);
 
 	env->me_map[env->me_mapcount] = MapViewOfFile(mh, flags & MDB_WRITEMAP ?
 		FILE_MAP_WRITE : FILE_MAP_READ,
 		offhi, offlo, size);
 	rc = env->me_map[env->me_mapcount] ? 0 : ErrCode();
-	
+
 	CloseHandle(mh);
 	if (rc)
 		return rc;
@@ -1483,6 +1492,7 @@ mdb_map_grow_size(MDB_env *env)
 	size_t size;
 	size = env->me_mapsize[env->me_mapcount-1] *2;
 	size &= ~(size_t)65535;
+	if (size < 128 * 1024) size = 128 * 1024;
 	if(size < 1024*1024) return 1024*1024;
 	if(size > 64*1024*1024) return 64*1024*1024;
 	return size;
@@ -1491,35 +1501,36 @@ mdb_map_grow_size(MDB_env *env)
 static int
 mdb_env_page_get(MDB_env *env, pgno_t pgno, MDB_page** pg_get)
 {
-	int i, rc;	
+	int i, rc;
 	size_t size, grow, pos, offset;
-       
+
 	if(pgno > env->me_maxusedpg)
 		env->me_maxusedpg = pgno;
-	
+
 	pos = pgno * env->me_psize;
 	offset = pos;
 
     size = 0;
 	for(i=0;i<env->me_mapcount;i++){
-		size += env->me_mapsize[i];		
+		size += env->me_mapsize[i];
 		if(pos < size)
-			goto done;				
+			goto done;
 		offset -= env->me_mapsize[i];
 	}
 
-	for(;i<MDB_MAP_CHUNK_MAX;i++){		
+	for(;i<MDB_MAP_CHUNK_MAX;i++){
 		grow = mdb_map_grow_size(env);
 		size += grow;
 		rc = mdb_map_next(env, size - grow, grow);
-		if(rc) return rc;
+		if(rc)
+			return rc;
 		if(pos < size)
-			goto done;	
+			goto done;
 		offset -= env->me_mapsize[i];
 	}
 
 
-	return MDB_MAP_FULL;		
+	return MDB_MAP_FULL;
 done:
 	*pg_get = (MDB_page*)(env->me_map[i] + offset);
 	return 0;
@@ -3386,8 +3397,8 @@ mdb_env_write_meta(MDB_txn *txn)
 
 	if (env->me_flags & MDB_WRITEMAP) {
 		/* Persist any increases of mapsize config */
-		if (env->me_filesize > mp->mm_mapsize)
-			mp->mm_mapsize = env->me_filesize;
+		if (mdb_env_max_used(env) > mp->mm_mapsize)
+			mp->mm_mapsize = mdb_env_max_used(env);;
 		mp->mm_dbs[0] = txn->mt_dbs[0];
 		mp->mm_dbs[1] = txn->mt_dbs[1];
 		mp->mm_last_pg = txn->mt_next_pgno - 1;
@@ -3415,9 +3426,9 @@ mdb_env_write_meta(MDB_txn *txn)
 	metab.mm_last_pg = env->me_metas[toggle]->mm_last_pg;
 
 	ptr = (char *)&meta;
-	if (env->me_mapsize > mp->mm_mapsize) {
+	if (mdb_env_max_used(env) > mp->mm_mapsize) {
 		/* Persist any increases of mapsize config */
-		meta.mm_mapsize = env->me_mapsize;
+		meta.mm_mapsize = mdb_env_max_used(env);
 		off = offsetof(MDB_meta, mm_mapsize);
 	} else {
 		off = offsetof(MDB_meta, mm_dbs[0].md_depth);
@@ -3706,7 +3717,7 @@ mdb_env_open2(MDB_env *env)
 			env->me_mapsize[0] = minsize;
 	}
 
-	rc = mdb_env_map(env, meta.mm_address, newenv || env->me_mapsize[0] != meta.mm_mapsize);
+	rc = mdb_env_map(env, meta.mm_address, newenv);// || env->me_mapsize[0] != meta.mm_mapsize);
 	if (rc)
 		return rc;
 
@@ -4319,7 +4330,7 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 	size_lo = GetFileSize(env->me_fd, &size_hi);
 	file_size = (size_t)size_hi << 32 | size_lo;
 	file_size = (file_size + 65535) & ~(size_t)65535;
-	
+
 	env->me_filesize = file_size > env->me_mapsize[0] ? file_size : env->me_mapsize[0];
 #endif
 
@@ -4403,12 +4414,13 @@ mdb_env_close0(MDB_env *env, int excl)
 	}
 
 	for(i=0;i<env->me_mapcount;i++)
-		munmap(env->me_map[i], env->me_mapsize[i]);	
+		munmap(env->me_map[i], env->me_mapsize[i]);
 	if (env->me_mfd != env->me_fd && env->me_mfd != INVALID_HANDLE_VALUE)
 		(void) close(env->me_mfd);
 	if (env->me_fd != INVALID_HANDLE_VALUE){
-		if (env->me_mapcount > 1){
-			file_end = (env->me_maxusedpg == 0 ? 3 : env->me_maxusedpg + 1) * env->me_psize;
+		if (env->me_mapcount > 1) // means we wrote and extended the file
+		{
+			file_end = mdb_env_max_used(env);
 			rc = mdb_ftruncate(env->me_fd, file_end);
 		}
 		(void)close(env->me_fd);
