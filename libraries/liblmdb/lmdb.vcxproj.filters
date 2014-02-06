@@ -29,8 +29,5 @@
     <ClCompile Include="midl.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="mtest.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
   </ItemGroup>
 </Project>
