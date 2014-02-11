@@ -3778,7 +3778,7 @@ mdb_env_reader_dest(void *ptr)
  *	in a single process, for now. They can override this if needed.
  */
 #ifndef MAX_TLS_KEYS
-#define MAX_TLS_KEYS	64
+#define MAX_TLS_KEYS	1088
 #endif
 static pthread_key_t mdb_tls_keys[MAX_TLS_KEYS];
 static int mdb_tls_nkeys;
@@ -4003,6 +4003,46 @@ mdb_hash_enc(MDB_val *val, char *encbuf)
 }
 #endif
 
+#ifdef _WIN32
+static int
+mdb_name_mutexes(MDB_env* env)
+{
+	int rc;
+	BY_HANDLE_FILE_INFORMATION stbuf;
+	struct {
+		DWORD volume;
+		DWORD nhigh;
+		DWORD nlow;
+	} idbuf;
+	MDB_val val;
+	char encbuf[11];
+
+	if (!mdb_sec_inited) {
+		InitializeSecurityDescriptor(&mdb_null_sd,
+			SECURITY_DESCRIPTOR_REVISION);
+		SetSecurityDescriptorDacl(&mdb_null_sd, TRUE, 0, FALSE);
+		mdb_all_sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+		mdb_all_sa.bInheritHandle = FALSE;
+		mdb_all_sa.lpSecurityDescriptor = &mdb_null_sd;
+		mdb_sec_inited = 1;
+	}
+	if (!GetFileInformationByHandle(env->me_lfd, &stbuf)) goto fail_errno;
+	idbuf.volume = stbuf.dwVolumeSerialNumber;
+	idbuf.nhigh = stbuf.nFileIndexHigh;
+	idbuf.nlow = stbuf.nFileIndexLow;
+	val.mv_data = &idbuf;
+	val.mv_size = sizeof(idbuf);
+	mdb_hash_enc(&val, encbuf);
+	sprintf(env->me_txns->mti_rmname, "Global\\MDBr%s", encbuf);
+	sprintf(env->me_txns->mti_wmname, "Global\\MDBw%s", encbuf);
+	//printf("using read mutex name: %s\n", env->me_txns->mti_rmname);
+	return MDB_SUCCESS;
+fail_errno:
+	rc = ErrCode();
+	return rc;
+}
+#endif
+
 /** Open and/or initialize the lock region for the environment.
  * @param[in] env The MDB environment.
  * @param[in] lpath The pathname of the file used for the lock region.
@@ -4072,7 +4112,8 @@ mdb_env_setup_locks(MDB_env *env, char *lpath, int mode, int *excl)
 	size = GetFileSize(env->me_lfd, NULL);
 #else
 	size = lseek(env->me_lfd, 0, SEEK_END);
-	if (size == -1) goto fail_errno;
+	if (size == -1)
+		goto fail_errno;
 #endif
 	rsize = (env->me_maxreaders-1) * sizeof(MDB_reader) + sizeof(MDB_txninfo);
 	if (size < rsize && *excl > 0) {
@@ -4093,10 +4134,12 @@ mdb_env_setup_locks(MDB_env *env, char *lpath, int mode, int *excl)
 		HANDLE mh;
 		mh = CreateFileMapping(env->me_lfd, NULL, PAGE_READWRITE,
 			0, 0, NULL);
-		if (!mh) goto fail_errno;
+		if (!mh)
+			goto fail_errno;
 		env->me_txns = MapViewOfFileEx(mh, FILE_MAP_WRITE, 0, 0, rsize, NULL);
 		CloseHandle(mh);
-		if (!env->me_txns) goto fail_errno;
+		if (!env->me_txns)
+			goto fail_errno;
 #else
 		void *m = mmap(NULL, rsize, PROT_READ|PROT_WRITE, MAP_SHARED,
 			env->me_lfd, 0);
@@ -4106,37 +4149,14 @@ mdb_env_setup_locks(MDB_env *env, char *lpath, int mode, int *excl)
 	}
 	if (*excl > 0) {
 #ifdef _WIN32
-		BY_HANDLE_FILE_INFORMATION stbuf;
-		struct {
-			DWORD volume;
-			DWORD nhigh;
-			DWORD nlow;
-		} idbuf;
-		MDB_val val;
-		char encbuf[11];
-
-		if (!mdb_sec_inited) {
-			InitializeSecurityDescriptor(&mdb_null_sd,
-				SECURITY_DESCRIPTOR_REVISION);
-			SetSecurityDescriptorDacl(&mdb_null_sd, TRUE, 0, FALSE);
-			mdb_all_sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-			mdb_all_sa.bInheritHandle = FALSE;
-			mdb_all_sa.lpSecurityDescriptor = &mdb_null_sd;
-			mdb_sec_inited = 1;
-		}
-		if (!GetFileInformationByHandle(env->me_lfd, &stbuf)) goto fail_errno;
-		idbuf.volume = stbuf.dwVolumeSerialNumber;
-		idbuf.nhigh  = stbuf.nFileIndexHigh;
-		idbuf.nlow   = stbuf.nFileIndexLow;
-		val.mv_data = &idbuf;
-		val.mv_size = sizeof(idbuf);
-		mdb_hash_enc(&val, encbuf);
-		sprintf(env->me_txns->mti_rmname, "Global\\MDBr%s", encbuf);
-		sprintf(env->me_txns->mti_wmname, "Global\\MDBw%s", encbuf);
+		rc = mdb_name_mutexes(env);
+		if (rc) goto fail;
 		env->me_rmutex = CreateMutex(&mdb_all_sa, FALSE, env->me_txns->mti_rmname);
-		if (!env->me_rmutex) goto fail_errno;
+		if (!env->me_rmutex)
+			goto fail_errno;
 		env->me_wmutex = CreateMutex(&mdb_all_sa, FALSE, env->me_txns->mti_wmname);
-		if (!env->me_wmutex) goto fail_errno;
+		if (!env->me_wmutex)
+			goto fail_errno;
 #elif defined(MDB_USE_POSIX_SEM)
 		struct stat stbuf;
 		struct {
@@ -4204,15 +4224,21 @@ mdb_env_setup_locks(MDB_env *env, char *lpath, int mode, int *excl)
 			goto fail;
 		}
 #ifdef _WIN32
-		env->me_rmutex = OpenMutex(SYNCHRONIZE, FALSE, env->me_txns->mti_rmname);
-		if (!env->me_rmutex) goto fail_errno;
-		env->me_wmutex = OpenMutex(SYNCHRONIZE, FALSE, env->me_txns->mti_wmname);
-		if (!env->me_wmutex) goto fail_errno;
+		rc = mdb_name_mutexes(env);
+		if (rc) goto fail;
+		env->me_rmutex = CreateMutex(&mdb_all_sa, FALSE, env->me_txns->mti_rmname);
+		if (!env->me_rmutex)
+			goto fail_errno;
+		env->me_wmutex = CreateMutex(&mdb_all_sa, FALSE, env->me_txns->mti_wmname);
+		if (!env->me_wmutex)
+			goto fail_errno;
 #elif defined(MDB_USE_POSIX_SEM)
 		env->me_rmutex = sem_open(env->me_txns->mti_rmname, 0);
-		if (env->me_rmutex == SEM_FAILED) goto fail_errno;
+		if (env->me_rmutex == SEM_FAILED)
+			goto fail_errno;
 		env->me_wmutex = sem_open(env->me_txns->mti_wmname, 0);
-		if (env->me_wmutex == SEM_FAILED) goto fail_errno;
+		if (env->me_wmutex == SEM_FAILED)
+			goto fail_errno;
 #endif
 	}
 	return MDB_SUCCESS;
