@@ -1029,6 +1029,7 @@ typedef struct MDB_pgstate {
 #ifdef _WIN32
 #define MDB_MAP_CHUNK_MAX 128
 typedef long long ssize_t;
+#define strdup _strdup
 #else
 #define MDB_MAP_CHUNK_MAX 1
 #endif
@@ -1055,17 +1056,14 @@ struct MDB_env {
 	MDB_dbi		me_maxdbs;		/**< size of the DB table */
 	MDB_PID_T	me_pid;		/**< process ID of this env */
 	char		*me_path;		/**< path to the DB files */
-	char    	*me_map[MDB_MAP_CHUNK_MAX];		/**< the memory map of the data file */
-	uint64_t    me_mapsize[MDB_MAP_CHUNK_MAX];        /**< mapping lengths */
-	uint8_t         me_mapcount;          /**< count of used me_map's */
+	char		*me_map;		/**< the memory map of the data file */
 	MDB_txninfo	*me_txns;		/**< the memory map of the lock file or NULL */
 	MDB_meta	*me_metas[2];	/**< pointers to the two meta pages */
 	void		*me_pbuf;		/**< scratch area for DUPSORT put() */
 	MDB_txn		*me_txn;		/**< current write transaction */
-	size_t          me_filesize;            /**< current size of file */
+	size_t		me_mapsize;		/**< size of the data memory map */
 	off_t		me_size;		/**< current file size */
 	pgno_t		me_maxpg;		/**< me_mapsize / me_psize */
-	pgno_t      me_maxusedpg;   /**< max used page since env has been open */
 	MDB_dbx		*me_dbxs;		/**< array of static DB info */
 	uint16_t	*me_dbflags;	/**< array of flags from MDB_db.md_flags */
 	pthread_key_t	me_txkey;	/**< thread-key for readers */
@@ -1179,9 +1177,6 @@ static MDB_cmp_func	mdb_cmp_memn, mdb_cmp_memnr, mdb_cmp_int, mdb_cmp_cint, mdb_
 static SECURITY_DESCRIPTOR mdb_null_sd;
 static SECURITY_ATTRIBUTES mdb_all_sa;
 static int mdb_sec_inited;
-
-#define MDB_WIN_ERROR 1000
-static char* mdb_winstrerror(int e);
 #endif
 
 /** Return the library version info. */
@@ -1228,19 +1223,8 @@ mdb_strerror(int err)
 		i = err - MDB_KEYEXIST;
 		return mdb_errstr[i];
 	}
-#ifdef _WIN32
-	if(err >= MDB_WIN_ERROR){
-		return mdb_winstrerror(err - MDB_WIN_ERROR);
-	}
-	return mdb_winstrerror(err);
-#endif
 
 	return strerror(err);
-}
-
-size_t mdb_env_max_used(MDB_env *env)
-{
-	return (env->me_maxusedpg == 0 ? 3 : env->me_maxusedpg + 1) * env->me_psize;
 }
 
 /** assert(3) variant in cursor context */
@@ -1413,127 +1397,6 @@ static void mdb_audit(MDB_txn *txn)
 		fprintf(stderr, "audit: %lu freecount: %lu count: %lu total: %lu next_pgno: %lu\n",
 			txn->mt_txnid, freecount, count+2, freecount+count+2, txn->mt_next_pgno);
 	}
-}
-#endif
-
-#ifdef _WIN32
-static int
-mdb_winerrno()
-{
-	return GetLastError() + MDB_WIN_ERROR;
-}
-
-static char*
-mdb_winstrerror(int e)
-{
-	char *s = NULL;
-	FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-		      NULL, e,
-		      MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-		      &s, 0, NULL);
-	return s;
-}
-
-static int
-mdb_ftruncate(HANDLE fd, size_t size)
-{
-	size = (size + 65535) & ~(size_t)65535;
-	LARGE_INTEGER position;
-	position.QuadPart = (LONGLONG)size;
-	if (!SetFilePointerEx(fd, position, NULL, FILE_BEGIN) ||
-		!SetEndOfFile(fd) ||
-		SetFilePointer(fd, 0, NULL, FILE_BEGIN) == INVALID_SET_FILE_POINTER)
-		return mdb_winerrno();
-	return 0;
-}
-
-int
-mdb_map_next(MDB_env *env, size_t offset, size_t size)
-{
-	MDB_page *p;
-	unsigned int flags = env->me_flags;
-	int rc;
-	HANDLE mh;
-	DWORD offlo,offhi;
-	size_t file_size;
-
-	file_size = offset + size;
-
-	rc = mdb_ftruncate(env->me_fd, file_size);
-	if(rc)
-		return rc;
-	mh = CreateFileMapping(env->me_fd, NULL, flags & MDB_WRITEMAP ?
-		PAGE_READWRITE : PAGE_READONLY,
-		0, 0, NULL);
-	if (!mh)
-		return ErrCode();
-
-	offlo = offset & 0xffffffff;
-	offhi = (DWORD)(offset >> 16 >> 16);
-
-	env->me_map[env->me_mapcount] = MapViewOfFile(mh, flags & MDB_WRITEMAP ?
-		FILE_MAP_WRITE : FILE_MAP_READ,
-		offhi, offlo, size);
-	rc = env->me_map[env->me_mapcount] ? 0 : ErrCode();
-
-	CloseHandle(mh);
-	if (rc)
-		return rc;
-	env->me_mapsize[env->me_mapcount] = size;
-	env->me_mapcount++;
-	env->me_maxpg = file_size / env->me_psize;
-	env->me_filesize = file_size;
-	return 0;
-}
-
-static size_t
-mdb_map_grow_size(MDB_env *env)
-{
-	size_t size;
-	size = env->me_mapsize[env->me_mapcount-1] *2;
-	size &= ~(size_t)65535;
-	if (size < 128 * 1024) size = 128 * 1024;
-	if(size < 1024*1024) return 1024*1024;
-	if(size > 64*1024*1024) return 64*1024*1024;
-	return size;
-}
-
-static int
-mdb_env_page_get(MDB_env *env, pgno_t pgno, MDB_page** pg_get)
-{
-	int i, rc;
-	size_t size, grow, pos, offset;
-
-	if(pgno > env->me_maxusedpg)
-		env->me_maxusedpg = pgno;
-
-	pos = pgno * env->me_psize;
-	offset = pos;
-
-    size = 0;
-	for(i=0;i<env->me_mapcount;i++){
-		size += env->me_mapsize[i];
-		if(pos < size)
-			goto done;
-		offset -= env->me_mapsize[i];
-	}
-
-	for(;i<MDB_MAP_CHUNK_MAX;i++){
-		grow = mdb_map_grow_size(env);
-		size += grow;
-		rc = mdb_map_next(env, size - grow, grow);
-		if(rc)
-			return rc;
-		if(pos < size)
-			goto done;
-		offset -= env->me_mapsize[i];
-	}
-
-
-	return MDB_MAP_FULL;
-done:
-	*pg_get = (MDB_page*)(env->me_map[i] + offset);
-	return 0;
 }
 #endif
 
@@ -1998,9 +1861,6 @@ mdb_page_alloc(MDB_cursor *mc, int num, MDB_page **mp)
 	/* Use new pages from the map when nothing suitable in the freeDB */
 	i = 0;
 	pgno = txn->mt_next_pgno;
-	/* Grow the file on demand, so make sure this page has been allocated */
-	rc = mdb_env_page_get(env, pgno + num, &np);
-	if(rc) goto fail;
 	if (pgno + num >= env->me_maxpg) {
 			DPUTS("DB size maxed out");
 			rc = MDB_MAP_FULL;
@@ -2009,8 +1869,7 @@ mdb_page_alloc(MDB_cursor *mc, int num, MDB_page **mp)
 
 search_done:
 	if (env->me_flags & MDB_WRITEMAP) {
-		rc = mdb_env_page_get(env, pgno + num, &np);
-		if(rc) goto fail;
+		np = (MDB_page *)(env->me_map + env->me_psize * pgno);
 	} else {
 		if (!(np = mdb_page_malloc(txn, num))) {
 			rc = ENOMEM;
@@ -2230,14 +2089,13 @@ fail:
 int
 mdb_env_sync(MDB_env *env, int force)
 {
-	int rc = 0,i;
+	int rc = 0;
 	if (force || !F_ISSET(env->me_flags, MDB_NOSYNC)) {
 		if (env->me_flags & MDB_WRITEMAP) {
 			int flags = ((env->me_flags & MDB_MAPASYNC) && !force)
 				? MS_ASYNC : MS_SYNC;
-			for(i=0;i<env->me_mapcount;i++)
-				if (MDB_MSYNC(env->me_map[i], env->me_mapsize[i], flags))
-					rc = ErrCode();
+			if (MDB_MSYNC(env->me_map, env->me_mapsize, flags))
+				rc = ErrCode();
 #ifdef _WIN32
 			else if (flags == MS_SYNC && MDB_FDATASYNC(env->me_fd))
 				rc = ErrCode();
@@ -3397,8 +3255,8 @@ mdb_env_write_meta(MDB_txn *txn)
 
 	if (env->me_flags & MDB_WRITEMAP) {
 		/* Persist any increases of mapsize config */
-		if (mdb_env_max_used(env) > mp->mm_mapsize)
-			mp->mm_mapsize = mdb_env_max_used(env);;
+		if (env->me_mapsize > mp->mm_mapsize)
+			mp->mm_mapsize = env->me_mapsize;
 		mp->mm_dbs[0] = txn->mt_dbs[0];
 		mp->mm_dbs[1] = txn->mt_dbs[1];
 		mp->mm_last_pg = txn->mt_next_pgno - 1;
@@ -3406,7 +3264,7 @@ mdb_env_write_meta(MDB_txn *txn)
 		if (!(env->me_flags & (MDB_NOMETASYNC|MDB_NOSYNC))) {
 			unsigned meta_size = env->me_psize;
 			rc = (env->me_flags & MDB_MAPASYNC) ? MS_ASYNC : MS_SYNC;
-			ptr = env->me_map[0];
+			ptr = env->me_map;
 			if (toggle) {
 #ifndef _WIN32	/* POSIX msync() requires ptr = start of OS page */
 				if (meta_size < env->me_os_psize)
@@ -3426,9 +3284,9 @@ mdb_env_write_meta(MDB_txn *txn)
 	metab.mm_last_pg = env->me_metas[toggle]->mm_last_pg;
 
 	ptr = (char *)&meta;
-	if (mdb_env_max_used(env) > mp->mm_mapsize) {
+	if (env->me_mapsize > mp->mm_mapsize) {
 		/* Persist any increases of mapsize config */
-		meta.mm_mapsize = mdb_env_max_used(env);
+		meta.mm_mapsize = env->me_mapsize;
 		off = offsetof(MDB_meta, mm_mapsize);
 	} else {
 		off = offsetof(MDB_meta, mm_dbs[0].md_depth);
@@ -3536,12 +3394,8 @@ mdb_env_map(MDB_env *env, void *addr, int newsize)
 	int rc;
 	HANDLE mh;
 	LONG sizelo, sizehi;
-	size_t size;
-
-	size = (env->me_filesize + 65535) & ~(size_t)65535;
-
-	sizelo = size & 0xffffffff;
-	sizehi = size >> 16 >> 16; /* only needed on Win64 */
+	sizelo = env->me_mapsize & 0xffffffff;
+	sizehi = env->me_mapsize >> 16 >> 16; /* only needed on Win64 */
 
 	/* Windows won't create mappings for zero length files.
 	 * Just allocate the maxsize right now.
@@ -3557,13 +3411,10 @@ mdb_env_map(MDB_env *env, void *addr, int newsize)
 		sizehi, sizelo, NULL);
 	if (!mh)
 		return ErrCode();
-	env->me_map[0] = MapViewOfFileEx(mh, flags & MDB_WRITEMAP ?
+	env->me_map = MapViewOfFileEx(mh, flags & MDB_WRITEMAP ?
 		FILE_MAP_WRITE : FILE_MAP_READ,
-		0, 0, env->me_filesize, addr);
-	rc = env->me_map[0] ? 0 : ErrCode();
-	env->me_mapcount = 1;
-	env->me_maxpg = env->me_filesize / env->me_psize;
-	env->me_mapsize[0] = env->me_filesize;
+		0, 0, env->me_mapsize, addr);
+	rc = env->me_map ? 0 : ErrCode();
 	CloseHandle(mh);
 	if (rc)
 		return rc;
@@ -3574,7 +3425,7 @@ mdb_env_map(MDB_env *env, void *addr, int newsize)
 		if (ftruncate(env->me_fd, env->me_mapsize) < 0)
 			return ErrCode();
 	}
-	env->me_map = mmap(addr, env->me_mapsize[0], prot, MAP_SHARED,
+	env->me_map = mmap(addr, env->me_mapsize, prot, MAP_SHARED,
 		env->me_fd, 0);
 	if (env->me_map == MAP_FAILED) {
 		env->me_map = NULL;
@@ -3584,10 +3435,10 @@ mdb_env_map(MDB_env *env, void *addr, int newsize)
 	if (flags & MDB_NORDAHEAD) {
 		/* Turn off readahead. It's harmful when the DB is larger than RAM. */
 #ifdef MADV_RANDOM
-		madvise(env->me_map, env->me_mapsize[0], MADV_RANDOM);
+		madvise(env->me_map, env->me_mapsize, MADV_RANDOM);
 #else
 #ifdef POSIX_MADV_RANDOM
-		posix_madvise(env->me_map, env->me_mapsize[0], POSIX_MADV_RANDOM);
+		posix_madvise(env->me_map, env->me_mapsize, POSIX_MADV_RANDOM);
 #endif /* POSIX_MADV_RANDOM */
 #endif /* MADV_RANDOM */
 	}
@@ -3598,10 +3449,10 @@ mdb_env_map(MDB_env *env, void *addr, int newsize)
 	 * The MAP_FIXED flag would prevent that, but then mmap could
 	 * instead unmap existing pages to make room for the new map.
 	 */
-	if (addr && env->me_map[0] != addr)
+	if (addr && env->me_map != addr)
 		return EBUSY;	/* TODO: Make a new MDB_* error code? */
 
-	p = (MDB_page *)env->me_map[0];
+	p = (MDB_page *)env->me_map;
 	env->me_metas[0] = METADATA(p);
 	env->me_metas[1] = (MDB_meta *)((char *)env->me_metas[0] + env->me_psize);
 
@@ -3614,14 +3465,14 @@ mdb_env_set_mapsize(MDB_env *env, size_t size)
 	/* If env is already open, caller is responsible for making
 	 * sure there are no active txns.
 	 */
-	if (env->me_map[0]) {
+	if (env->me_map) {
 		int rc;
 		void *old;
 		if (env->me_txn)
 			return EINVAL;
 		if (!size)
 			size = env->me_metas[mdb_env_pick_meta(env)]->mm_mapsize;
-		else if (size < env->me_filesize) {
+		else if (size < env->me_mapsize) {
 			/* If the configured size is smaller, make sure it's
 			 * still big enough. Silently round up to minimum if not.
 			 */
@@ -3629,23 +3480,23 @@ mdb_env_set_mapsize(MDB_env *env, size_t size)
 			if (size < minsize)
 				size = minsize;
 		}
-		munmap(env->me_map[0], env->me_mapsize[0]);
-		env->me_mapsize[0] = size;
-		old = (env->me_flags & MDB_FIXEDMAP) ? env->me_map[0] : NULL;
+		munmap(env->me_map, env->me_mapsize);
+		env->me_mapsize = size;
+		old = (env->me_flags & MDB_FIXEDMAP) ? env->me_map : NULL;
 		rc = mdb_env_map(env, old, 1);
 		if (rc)
 			return rc;
 	}
-	env->me_mapsize[0] = size;
+	env->me_mapsize = size;
 	if (env->me_psize)
-		env->me_maxpg = env->me_mapsize[0] / env->me_psize;
+		env->me_maxpg = env->me_mapsize / env->me_psize;
 	return MDB_SUCCESS;
 }
 
 int
 mdb_env_set_maxdbs(MDB_env *env, MDB_dbi dbs)
 {
-	if (env->me_map[0])
+	if (env->me_map)
 		return EINVAL;
 	env->me_maxdbs = dbs + 2; /* Named databases + main and free DB */
 	return MDB_SUCCESS;
@@ -3654,7 +3505,7 @@ mdb_env_set_maxdbs(MDB_env *env, MDB_dbi dbs)
 int
 mdb_env_set_maxreaders(MDB_env *env, unsigned int readers)
 {
-	if (env->me_map[0] || readers < 1)
+	if (env->me_map || readers < 1)
 		return EINVAL;
 	env->me_maxreaders = readers;
 	return MDB_SUCCESS;
@@ -3703,27 +3554,27 @@ mdb_env_open2(MDB_env *env)
 	}
 
 	/* Was a mapsize configured? */
-	if (!env->me_mapsize[0]) {
+	if (!env->me_mapsize) {
 		/* If this is a new environment, take the default,
 		 * else use the size recorded in the existing env.
 		 */
-		env->me_mapsize[0] = newenv ? DEFAULT_MAPSIZE : meta.mm_mapsize;
-	} else if (env->me_mapsize[0] < meta.mm_mapsize) {
+		env->me_mapsize = newenv ? DEFAULT_MAPSIZE : meta.mm_mapsize;
+	} else if (env->me_mapsize < meta.mm_mapsize) {
 		/* If the configured size is smaller, make sure it's
 		 * still big enough. Silently round up to minimum if not.
 		 */
 		size_t minsize = (meta.mm_last_pg + 1) * meta.mm_psize;
-		if (env->me_mapsize[0] < minsize)
-			env->me_mapsize[0] = minsize;
+		if (env->me_mapsize < minsize)
+			env->me_mapsize = minsize;
 	}
 
-	rc = mdb_env_map(env, meta.mm_address, newenv);// || env->me_mapsize[0] != meta.mm_mapsize);
+	rc = mdb_env_map(env, meta.mm_address, newenv || env->me_mapsize != meta.mm_mapsize);
 	if (rc)
 		return rc;
 
 	if (newenv) {
 		if (flags & MDB_FIXEDMAP)
-			meta.mm_address = env->me_map[0];
+			meta.mm_address = env->me_map;
 		i = mdb_env_init_meta(env, &meta);
 		if (i != MDB_SUCCESS) {
 			return i;
@@ -3736,7 +3587,7 @@ mdb_env_open2(MDB_env *env)
 #if !(MDB_MAXKEYSIZE)
 	env->me_maxkey = env->me_nodemax - (NODESIZE + sizeof(MDB_db));
 #endif
-	env->me_maxpg = env->me_mapsize[0] / env->me_psize;
+	env->me_maxpg = env->me_mapsize / env->me_psize;
 
 #if MDB_DEBUG
 	{
@@ -4003,46 +3854,6 @@ mdb_hash_enc(MDB_val *val, char *encbuf)
 }
 #endif
 
-#ifdef _WIN32
-static int
-mdb_name_mutexes(MDB_env* env)
-{
-	int rc;
-	BY_HANDLE_FILE_INFORMATION stbuf;
-	struct {
-		DWORD volume;
-		DWORD nhigh;
-		DWORD nlow;
-	} idbuf;
-	MDB_val val;
-	char encbuf[11];
-
-	if (!mdb_sec_inited) {
-		InitializeSecurityDescriptor(&mdb_null_sd,
-			SECURITY_DESCRIPTOR_REVISION);
-		SetSecurityDescriptorDacl(&mdb_null_sd, TRUE, 0, FALSE);
-		mdb_all_sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-		mdb_all_sa.bInheritHandle = FALSE;
-		mdb_all_sa.lpSecurityDescriptor = &mdb_null_sd;
-		mdb_sec_inited = 1;
-	}
-	if (!GetFileInformationByHandle(env->me_lfd, &stbuf)) goto fail_errno;
-	idbuf.volume = stbuf.dwVolumeSerialNumber;
-	idbuf.nhigh = stbuf.nFileIndexHigh;
-	idbuf.nlow = stbuf.nFileIndexLow;
-	val.mv_data = &idbuf;
-	val.mv_size = sizeof(idbuf);
-	mdb_hash_enc(&val, encbuf);
-	sprintf(env->me_txns->mti_rmname, "Global\\MDBr%s", encbuf);
-	sprintf(env->me_txns->mti_wmname, "Global\\MDBw%s", encbuf);
-	//printf("using read mutex name: %s\n", env->me_txns->mti_rmname);
-	return MDB_SUCCESS;
-fail_errno:
-	rc = ErrCode();
-	return rc;
-}
-#endif
-
 /** Open and/or initialize the lock region for the environment.
  * @param[in] env The MDB environment.
  * @param[in] lpath The pathname of the file used for the lock region.
@@ -4112,8 +3923,7 @@ mdb_env_setup_locks(MDB_env *env, char *lpath, int mode, int *excl)
 	size = GetFileSize(env->me_lfd, NULL);
 #else
 	size = lseek(env->me_lfd, 0, SEEK_END);
-	if (size == -1)
-		goto fail_errno;
+	if (size == -1) goto fail_errno;
 #endif
 	rsize = (env->me_maxreaders-1) * sizeof(MDB_reader) + sizeof(MDB_txninfo);
 	if (size < rsize && *excl > 0) {
@@ -4134,12 +3944,10 @@ mdb_env_setup_locks(MDB_env *env, char *lpath, int mode, int *excl)
 		HANDLE mh;
 		mh = CreateFileMapping(env->me_lfd, NULL, PAGE_READWRITE,
 			0, 0, NULL);
-		if (!mh)
-			goto fail_errno;
+		if (!mh) goto fail_errno;
 		env->me_txns = MapViewOfFileEx(mh, FILE_MAP_WRITE, 0, 0, rsize, NULL);
 		CloseHandle(mh);
-		if (!env->me_txns)
-			goto fail_errno;
+		if (!env->me_txns) goto fail_errno;
 #else
 		void *m = mmap(NULL, rsize, PROT_READ|PROT_WRITE, MAP_SHARED,
 			env->me_lfd, 0);
@@ -4149,14 +3957,37 @@ mdb_env_setup_locks(MDB_env *env, char *lpath, int mode, int *excl)
 	}
 	if (*excl > 0) {
 #ifdef _WIN32
-		rc = mdb_name_mutexes(env);
-		if (rc) goto fail;
+		BY_HANDLE_FILE_INFORMATION stbuf;
+		struct {
+			DWORD volume;
+			DWORD nhigh;
+			DWORD nlow;
+		} idbuf;
+		MDB_val val;
+		char encbuf[11];
+
+		if (!mdb_sec_inited) {
+			InitializeSecurityDescriptor(&mdb_null_sd,
+				SECURITY_DESCRIPTOR_REVISION);
+			SetSecurityDescriptorDacl(&mdb_null_sd, TRUE, 0, FALSE);
+			mdb_all_sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+			mdb_all_sa.bInheritHandle = FALSE;
+			mdb_all_sa.lpSecurityDescriptor = &mdb_null_sd;
+			mdb_sec_inited = 1;
+		}
+		if (!GetFileInformationByHandle(env->me_lfd, &stbuf)) goto fail_errno;
+		idbuf.volume = stbuf.dwVolumeSerialNumber;
+		idbuf.nhigh  = stbuf.nFileIndexHigh;
+		idbuf.nlow   = stbuf.nFileIndexLow;
+		val.mv_data = &idbuf;
+		val.mv_size = sizeof(idbuf);
+		mdb_hash_enc(&val, encbuf);
+		sprintf(env->me_txns->mti_rmname, "Global\\MDBr%s", encbuf);
+		sprintf(env->me_txns->mti_wmname, "Global\\MDBw%s", encbuf);
 		env->me_rmutex = CreateMutex(&mdb_all_sa, FALSE, env->me_txns->mti_rmname);
-		if (!env->me_rmutex)
-			goto fail_errno;
+		if (!env->me_rmutex) goto fail_errno;
 		env->me_wmutex = CreateMutex(&mdb_all_sa, FALSE, env->me_txns->mti_wmname);
-		if (!env->me_wmutex)
-			goto fail_errno;
+		if (!env->me_wmutex) goto fail_errno;
 #elif defined(MDB_USE_POSIX_SEM)
 		struct stat stbuf;
 		struct {
@@ -4224,21 +4055,15 @@ mdb_env_setup_locks(MDB_env *env, char *lpath, int mode, int *excl)
 			goto fail;
 		}
 #ifdef _WIN32
-		rc = mdb_name_mutexes(env);
-		if (rc) goto fail;
-		env->me_rmutex = CreateMutex(&mdb_all_sa, FALSE, env->me_txns->mti_rmname);
-		if (!env->me_rmutex)
-			goto fail_errno;
-		env->me_wmutex = CreateMutex(&mdb_all_sa, FALSE, env->me_txns->mti_wmname);
-		if (!env->me_wmutex)
-			goto fail_errno;
+		env->me_rmutex = OpenMutex(SYNCHRONIZE, FALSE, env->me_txns->mti_rmname);
+		if (!env->me_rmutex) goto fail_errno;
+		env->me_wmutex = OpenMutex(SYNCHRONIZE, FALSE, env->me_txns->mti_wmname);
+		if (!env->me_wmutex) goto fail_errno;
 #elif defined(MDB_USE_POSIX_SEM)
 		env->me_rmutex = sem_open(env->me_txns->mti_rmname, 0);
-		if (env->me_rmutex == SEM_FAILED)
-			goto fail_errno;
+		if (env->me_rmutex == SEM_FAILED) goto fail_errno;
 		env->me_wmutex = sem_open(env->me_txns->mti_wmname, 0);
-		if (env->me_wmutex == SEM_FAILED)
-			goto fail_errno;
+		if (env->me_wmutex == SEM_FAILED) goto fail_errno;
 #endif
 	}
 	return MDB_SUCCESS;
@@ -4272,10 +4097,6 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 {
 	int		oflags, rc, len, excl = -1;
 	char *lpath, *dpath;
-#ifdef _WIN32
-	size_t file_size;
-	DWORD size_lo, size_hi;
-#endif
 
 	if (env->me_fd!=INVALID_HANDLE_VALUE || (flags & ~(CHANGEABLE|CHANGELESS)))
 		return EINVAL;
@@ -4313,7 +4134,7 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 	if (rc)
 		goto leave;
 
-	env->me_path = _strdup(path);
+	env->me_path = strdup(path);
 	env->me_dbxs = calloc(env->me_maxdbs, sizeof(MDB_dbx));
 	env->me_dbflags = calloc(env->me_maxdbs, sizeof(uint16_t));
 	if (!(env->me_dbxs && env->me_path && env->me_dbflags)) {
@@ -4351,14 +4172,6 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 		rc = ErrCode();
 		goto leave;
 	}
-
-#ifdef _WIN32
-	size_lo = GetFileSize(env->me_fd, &size_hi);
-	file_size = (size_t)size_hi << 32 | size_lo;
-	file_size = (file_size + 65535) & ~(size_t)65535;
-
-	env->me_filesize = file_size > env->me_mapsize[0] ? file_size : env->me_mapsize[0];
-#endif
 
 	if ((flags & (MDB_RDONLY|MDB_NOLOCK)) == MDB_RDONLY) {
 		rc = mdb_env_setup_locks(env, lpath, mode, &excl);
@@ -4410,8 +4223,8 @@ leave:
 static void
 mdb_env_close0(MDB_env *env, int excl)
 {
-	int i, rc;
-	size_t file_end;
+	int i;
+
 	if (!(env->me_flags & MDB_ENV_ACTIVE))
 		return;
 
@@ -4439,24 +4252,19 @@ mdb_env_close0(MDB_env *env, int excl)
 #endif
 	}
 
-	for(i=0;i<env->me_mapcount;i++)
-		munmap(env->me_map[i], env->me_mapsize[i]);
+	if (env->me_map) {
+		munmap(env->me_map, env->me_mapsize);
+	}
 	if (env->me_mfd != env->me_fd && env->me_mfd != INVALID_HANDLE_VALUE)
 		(void) close(env->me_mfd);
-	if (env->me_fd != INVALID_HANDLE_VALUE){
-		if (env->me_mapcount > 1) // means we wrote and extended the file
-		{
-			file_end = mdb_env_max_used(env);
-			rc = mdb_ftruncate(env->me_fd, file_end);
-		}
-		(void)close(env->me_fd);
-	}
+	if (env->me_fd != INVALID_HANDLE_VALUE)
+		(void) close(env->me_fd);
 	if (env->me_txns) {
 		MDB_PID_T pid = env->me_pid;
 		/* Clearing readers is done in this function because
-			* me_txkey with its destructor must be disabled first.
-			*/
-		for (i = env->me_numreaders; --i >= 0;)
+		 * me_txkey with its destructor must be disabled first.
+		 */
+		for (i = env->me_numreaders; --i >= 0; )
 			if (env->me_txns->mti_readers[i].mr_pid == pid)
 				env->me_txns->mti_readers[i].mr_pid = 0;
 #ifdef _WIN32
@@ -4465,16 +4273,16 @@ mdb_env_close0(MDB_env *env, int excl)
 			if (env->me_wmutex) CloseHandle(env->me_wmutex);
 		}
 		/* Windows automatically destroys the mutexes when
-			* the last handle closes.
-			*/
+		 * the last handle closes.
+		 */
 #elif defined(MDB_USE_POSIX_SEM)
 		if (env->me_rmutex != SEM_FAILED) {
 			sem_close(env->me_rmutex);
 			if (env->me_wmutex != SEM_FAILED)
 				sem_close(env->me_wmutex);
 			/* If we have the filelock:  If we are the
-				* only remaining user, clean up semaphores.
-				*/
+			 * only remaining user, clean up semaphores.
+			 */
 			if (excl == 0)
 				mdb_env_excl_lock(env, &excl);
 			if (excl > 0) {
@@ -4483,21 +4291,21 @@ mdb_env_close0(MDB_env *env, int excl)
 			}
 		}
 #endif
-		munmap((void *)env->me_txns, (env->me_maxreaders - 1)*sizeof(MDB_reader)+sizeof(MDB_txninfo));
+		munmap((void *)env->me_txns, (env->me_maxreaders-1)*sizeof(MDB_reader)+sizeof(MDB_txninfo));
 	}
 	if (env->me_lfd != INVALID_HANDLE_VALUE) {
 #ifdef _WIN32
 		if (excl >= 0) {
 			/* Unlock the lockfile.  Windows would have unlocked it
-				* after closing anyway, but not necessarily at once.
-				*/
+			 * after closing anyway, but not necessarily at once.
+			 */
 			UnlockFile(env->me_lfd, 0, 0, 1, 0);
 		}
 #endif
-		(void)close(env->me_lfd);
+		(void) close(env->me_lfd);
 	}
 
-	env->me_flags &= ~(MDB_ENV_ACTIVE | MDB_ENV_TXKEY);
+	env->me_flags &= ~(MDB_ENV_ACTIVE|MDB_ENV_TXKEY);
 }
 
 int
@@ -4538,7 +4346,7 @@ mdb_env_copyfd(MDB_env *env, HANDLE fd)
 	}
 
 	wsize = env->me_psize * 2;
-	ptr = env->me_map[0];
+	ptr = env->me_map;
 	w2 = wsize;
 	while (w2 > 0) {
 		DO_WRITE(rc, fd, ptr, w2, len);
@@ -4907,7 +4715,7 @@ mdb_page_get(MDB_txn *txn, pgno_t pgno, MDB_page **ret, int *lvl)
 {
 	MDB_env *env = txn->mt_env;
 	MDB_page *p = NULL;
-	int level, rc;
+	int level;
 
 	if (!((txn->mt_flags & MDB_TXN_RDONLY) | (env->me_flags & MDB_WRITEMAP))) {
 		MDB_txn *tx2 = txn;
@@ -4924,8 +4732,7 @@ mdb_page_get(MDB_txn *txn, pgno_t pgno, MDB_page **ret, int *lvl)
 				MDB_ID pn = pgno << 1;
 				x = mdb_midl_search(tx2->mt_spill_pgs, pn);
 				if (x <= tx2->mt_spill_pgs[0] && tx2->mt_spill_pgs[x] == pn) {
-					rc = mdb_env_page_get(env, pgno, &p);
-					if (rc) return rc;
+					p = (MDB_page *)(env->me_map + env->me_psize * pgno);
 					goto done;
 				}
 			}
@@ -4942,8 +4749,7 @@ mdb_page_get(MDB_txn *txn, pgno_t pgno, MDB_page **ret, int *lvl)
 
 	if (pgno < txn->mt_next_pgno) {
 		level = 0;
-		rc = mdb_env_page_get(env, pgno, &p);
-		if (rc) return rc;
+		p = (MDB_page *)(env->me_map + env->me_psize * pgno);
 	} else {
 		DPRINTF(("page %"Z"u not found", pgno));
 		txn->mt_flags |= MDB_TXN_ERROR;
@@ -8246,7 +8052,7 @@ mdb_env_info(MDB_env *env, MDB_envinfo *arg)
 		return EINVAL;
 
 	toggle = mdb_env_pick_meta(env);
-	arg->me_mapaddr = (env->me_flags & MDB_FIXEDMAP) ? env->me_map[0] : 0;
+	arg->me_mapaddr = (env->me_flags & MDB_FIXEDMAP) ? env->me_map : 0;
 	arg->me_mapsize = env->me_mapsize;
 	arg->me_maxreaders = env->me_maxreaders;
 
@@ -8370,7 +8176,7 @@ int mdb_dbi_open(MDB_txn *txn, const char *name, unsigned int flags, MDB_dbi *db
 	/* OK, got info, add to table */
 	if (rc == MDB_SUCCESS) {
 		unsigned int slot = unused ? unused : txn->mt_numdbs;
-		txn->mt_dbxs[slot].md_name.mv_data = _strdup(name);
+		txn->mt_dbxs[slot].md_name.mv_data = strdup(name);
 		txn->mt_dbxs[slot].md_name.mv_size = len;
 		txn->mt_dbxs[slot].md_rel = NULL;
 		txn->mt_dbflags[slot] = dbflag;
@@ -8679,12 +8485,12 @@ int mdb_reader_check(MDB_env *env, int *dead)
 	if (!env->me_txns)
 		return MDB_SUCCESS;
 	rdrs = env->me_txns->mti_numreaders;
-	pids = malloc((rdrs + 1) * sizeof(MDB_PID_T));
+	pids = malloc((rdrs+1) * sizeof(MDB_PID_T));
 	if (!pids)
 		return ENOMEM;
 	pids[0] = 0;
 	mr = env->me_txns->mti_readers;
-	for (i = 0; i < rdrs; i++) {
+	for (i=0; i<rdrs; i++) {
 		if (mr[i].mr_pid && mr[i].mr_pid != env->me_pid) {
 			pid = mr[i].mr_pid;
 			if (mdb_pid_insert(pids, pid) == 0) {
@@ -8692,10 +8498,10 @@ int mdb_reader_check(MDB_env *env, int *dead)
 					LOCK_MUTEX_R(env);
 					/* Recheck, a new process may have reused pid */
 					if (!mdb_reader_pid(env, Pidcheck, pid)) {
-						for (j = i; j < rdrs; j++)
+						for (j=i; j<rdrs; j++)
 							if (mr[j].mr_pid == pid) {
 								DPRINTF(("clear stale reader pid %u txn %"Z"d",
-									(unsigned)pid, mr[j].mr_txnid));
+									(unsigned) pid, mr[j].mr_txnid));
 								mr[j].mr_pid = 0;
 								count++;
 							}
