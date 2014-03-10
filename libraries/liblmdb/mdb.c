@@ -4098,6 +4098,13 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 {
 	int		oflags, rc, len, excl = -1;
 	char *lpath, *dpath;
+#if _WIN32
+	void* mutex = NULL;
+	uint32_t wait;
+	MDB_val val;
+	char encbuf[11];
+	char mutex_name[128];
+#endif
 
 	if (env->me_fd!=INVALID_HANDLE_VALUE || (flags & ~(CHANGEABLE|CHANGELESS)))
 		return EINVAL;
@@ -4142,6 +4149,30 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 		rc = ENOMEM;
 		goto leave;
 	}
+
+#if _WIN32
+
+	val.mv_data = strdup(path);
+	val.mv_size = strlen(path);
+	for (int i = 0; i < val.mv_size; i++)
+		((char*)val.mv_data)[i] = toupper(((char*)val.mv_data)[i]);
+	mdb_hash_enc(&val, encbuf);
+	free(val.mv_data);
+	sprintf(mutex_name, "Global\\MDBe%s", encbuf);
+	mutex = CreateMutex(&mdb_all_sa, FALSE, mutex_name);
+	while (mutex){
+		wait = WaitForSingleObject(mutex, 5000);
+		if (wait == WAIT_ABANDONED) continue;
+		if (wait == WAIT_TIMEOUT || wait == WAIT_FAILED)
+		{
+			// close it so we don't try to release it later.
+			// hope for the best
+			CloseHandle(mutex);
+			mutex = NULL;
+		}
+		break;
+	}
+#endif
 
 	/* For RDONLY, get lockfile after we know datafile exists */
 	if (!(flags & (MDB_RDONLY|MDB_NOLOCK))) {
@@ -4217,6 +4248,13 @@ leave:
 		mdb_env_close0(env, excl);
 	}
 	free(lpath);
+#if _WIN32
+	if (mutex){
+		ReleaseMutex(mutex);
+		CloseHandle(mutex);
+	}
+#endif
+
 	return rc;
 }
 
