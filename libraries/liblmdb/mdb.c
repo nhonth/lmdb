@@ -4254,6 +4254,8 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 	MDB_val val;
 	char encbuf[11];
 	char mutex_name[128];
+	size_t file_size;
+	DWORD size_lo, size_hi;
 #endif
 
 	if (env->me_fd!=INVALID_HANDLE_VALUE || (flags & ~(CHANGEABLE|CHANGELESS)))
