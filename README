@@ -1,1 +1,3 @@
 Windows modifications to the lmdb key value database.
+
+Grow the database in chunks instead of mapping the whole thing all at once up front.
