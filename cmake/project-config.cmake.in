@@ -1,0 +1,25 @@
+# Configure @PROJECT_NAME@ package
+#
+# It defines the following variables
+#  @PROJECT_NAME@_FOUND        - TRUE
+#  @PROJECT_NAME@_INCLUDE_DIRS - include directories for @PROJECT_NAME@
+#  @PROJECT_NAME@_LIBRARY_DIRS - library directory
+#  @PROJECT_NAME@_LIBRARIES    - all the libraries of the components requested
+#                                if no components specified then all found
+#  @PROJECT_NAME@_VERSION      - @PROJECT_NAME@ library version
+
+message (STATUS "Reading ${CMAKE_CURRENT_LIST_FILE}")
+set (@PROJECT_NAME@_VERSION "@PACKAGE_VERSION@")
+message (STATUS "@PROJECT_NAME@ configuration, version "
+  ${@PROJECT_NAME@_VERSION})
+
+# Tell the user project where to find our headers and libraries
+get_filename_component (_DIR ${CMAKE_CURRENT_LIST_FILE} PATH)
+get_filename_component (PROJECT_ROOT_DIR "${_DIR}/@PROJECT_ROOT_DIR@" ABSOLUTE)
+set (@PROJECT_NAME@_INCLUDE_DIRS "${PROJECT_ROOT_DIR}/include")
+set (@PROJECT_NAME@_LIBRARY_DIRS "${PROJECT_ROOT_DIR}/lib")
+
+include ("${_DIR}/@PROJECT_NAME_LOWER@-depends.cmake")
+set (@PROJECT_NAME@_LIBRARIES @PROJECT_LIBRARY_LIST@)
+
+set (@PROJECT_NAME@_FOUND TRUE)
