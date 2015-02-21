@@ -947,9 +947,9 @@ MDB_DLL void mdb_txn_reset(MDB_txn *txn);
 MDB_DLL int  mdb_txn_renew(MDB_txn *txn);
 
 /** Compat with version <= 0.9.4, avoid clash with libmdb from MDB Tools project */
-//#define mdb_open(txn,name,flags,dbi)	mdb_dbi_open(txn,name,flags,dbi)
+#define mdb_open(txn,name,flags,dbi)	mdb_dbi_open(txn,name,flags,dbi)
 /** Compat with version <= 0.9.4, avoid clash with libmdb from MDB Tools project */
-//#define mdb_close(env,dbi)				mdb_dbi_close(env,dbi)
+#define mdb_close(env,dbi)				mdb_dbi_close(env,dbi)
 
 	/** @brief Open a database in the environment.
 	 *
