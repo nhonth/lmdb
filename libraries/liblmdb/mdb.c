@@ -68,13 +68,16 @@
 #include <errno.h>
 #include <limits.h>
 #include <stddef.h>
-#include <inttypes.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #ifndef _WIN32
 #include <unistd.h>
+#include <inttypes.h>
+#else
+#include "port_win/inttypes.h"
 #endif
 
 #if !(defined(BYTE_ORDER) || defined(__BYTE_ORDER))
@@ -1438,8 +1441,9 @@ mdb_winstrerror(int e)
 static int
 mdb_ftruncate(HANDLE fd, size_t size)
 {
+  LARGE_INTEGER position;
 	size = (size + 65535) & ~(size_t)65535;
-	LARGE_INTEGER position;
+	
 	position.QuadPart = (LONGLONG)size;
 	if (!SetFilePointerEx(fd, position, NULL, FILE_BEGIN) ||
 		!SetEndOfFile(fd) ||
@@ -4248,6 +4252,7 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 {
 	int		oflags, rc, len, excl = -1;
 	char *lpath, *dpath;
+  int i;
 #if _WIN32
 	void* mutex = NULL;
 	uint32_t wait;
@@ -4306,7 +4311,7 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 
 	val.mv_data = strdup(path);
 	val.mv_size = strlen(path);
-	for (int i = 0; i < val.mv_size; i++)
+	for (i = 0; i < val.mv_size; i++)
 		((char*)val.mv_data)[i] = toupper(((char*)val.mv_data)[i]);
 	mdb_hash_enc(&val, encbuf);
 	free(val.mv_data);
