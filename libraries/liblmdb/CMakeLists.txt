@@ -21,4 +21,4 @@ install(TARGETS ${PROJECT_NAME}
         ARCHIVE DESTINATION lib)
 
 # Install headers
-INSTALL(FILES ${snappy_HEADERS} DESTINATION include/lmdb)
+INSTALL(FILES ${${PROJECT_NAME}_HEADERS} DESTINATION include/lmdb)
